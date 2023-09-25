@@ -1,0 +1,446 @@
+#!/bin/sh
+
+# Presets
+manifest_dir="$(dirname "$0")/manifests"
+cache="/tmp/compose_sh/cache"
+services=""
+use_core=true
+
+# Helpers
+help() {
+    echo "Usage:"
+    echo "$0 [--no-core | -m <manifest_dir>] <MANIFESTS> <COMMAND>"
+    echo
+    echo "global args:"
+    echo "  -m  --manifest-dir <DIR>        -  custom manifest directory."
+    echo "                                         Default: \"$(dirname "$0")/manifests\""
+    echo "                     <MANIFESTS>  -  list of manifests to run."
+    echo "                                         See available manifests with \"$0 list\""
+    echo "                     <COMMAND>    -  subcommand to run."
+    echo "                                         Can be any one from COMMAND list"
+    echo
+    echo "COMMAND:"
+    echo "  up      -  run docker-compose up for all specified MANIFESTS"
+    echo "                 args: --no-core  -  don't run the core manifest"
+    echo "  down    -  run docker-compose down for all specified MANIFESTS"
+    echo "  list    -  list available manifests"
+    echo "  ps      -  show running manifests"
+    echo "  print   -  print the specified MANIFESTS"
+    echo "  edit    -  edit the specified MANIFESTS"
+    echo "  new     -  create new manifests with names specified with MANIFESTS"
+    echo "  help    -  print this message and exit"
+}
+
+# $1 cmd:
+#    - write
+#    - check
+#    - delete
+#    - read
+# $2 string to write|check|delete
+cache() {
+    cmd="$1"
+    arg="$2"
+
+    # Create cache dir
+    mkdir -p "$(dirname "$cache")"
+    touch "$cache"
+
+    writec() {
+        echo "$arg" | base64 >> "$cache"
+    }
+    readc() {
+        while read -r line; do
+            echo "$line" | base64 -d
+        done < "$cache"
+    }
+    checkc() {
+        encoded="$(echo "$arg" | base64)"
+        if ! (grep -q "$encoded" "$cache"); then
+            return 0
+        fi
+        return 1
+    }
+    deletec() {
+        encoded="$(echo "$arg" | base64)"
+        tmp="$(mktemp)"
+        sed -e "/${encoded}/d" "$cache" > "$tmp" && cp "$tmp" "$cache"
+    }
+    case "$cmd" in
+        "write")
+            checkc || return 1
+            writec
+            return 0
+            ;;
+        "read")
+            readc
+            return 0
+            ;;
+        "check")
+            checkc || return 1
+            return 0
+            ;;
+        "delete")
+            deletec
+            return 0
+            ;;
+    esac
+}
+
+# $1 list to pick from
+# $2 prompt
+# return selection (can be a list)
+picker() {
+    pick_list="$1"
+    prompt="$2"
+    num_of_lines="$(echo "$pick_list" | wc -l)"
+
+    # No lines
+    if [ -z "$pick_list" ]; then
+        return 1
+    fi
+    # One line
+    if [ "$num_of_lines" -eq 1 ]; then
+        echo "$pick_list"
+        return 0
+    fi
+
+    # Multiple lines
+    echo "$pick_list" | nl >&2
+
+    while true; do
+        printf "%s: [1-%d | all] " "$prompt" "$num_of_lines" >&2
+        read -r line_num
+
+        if [ "$line_num" = "all" ] || { [ "$line_num" -gt 0 ] && [ "$line_num" -lt $((num_of_lines + 1)) ]; }; then
+            if [ "$line_num" = "all" ]; then
+                # Return everything
+                echo "$pick_list"
+                return 0
+            fi
+            # Return selected line
+            echo "$pick_list" | sed -n "${line_num}p"
+            return 0
+        fi 2>/dev/null
+    done
+}
+
+# $1 raw service name
+# return (echo) service name
+# return codes:
+#     0 - no special value
+#     123 - full=true
+#     other - error
+service() {
+    echo "${1%=*}"
+
+    flag="${1##*=}"
+    if [ "$flag" = "full" ]; then
+        return 123
+    fi
+    return 0
+}
+
+# Args
+while [ "$#" -gt 1 ]; do
+    case "$1" in
+        "-m"|"--manifest-dir")
+            manifest_dir="$(realpath "$2")"
+            shift
+            ;;
+        "--no-core")
+            use_core=false
+            ;;
+        *)
+            if ! (echo "$services" | grep -q "\b$1\b"); then
+                services="$services $1"
+            fi
+            ;;
+    esac
+    shift
+done
+# last argument is command
+command="$1"
+
+# Universal checks
+if [ -z "$command" ]; then
+    echo "No command provided!"
+    exit 1
+fi
+if ! [ -d "$manifest_dir" ]; then
+    echo "Manifest directory \"$manifest_dir\" does not exist!"
+    exit 1
+fi
+if ! (command -v docker-compose > /dev/null); then
+    echo "Please install docker-compose and try again!"
+    exit 1
+fi
+
+# Sub commands
+list() {
+    cmds="$(find "$manifest_dir" -not -path '*/.*' -type f -name "*.yml" 2>/dev/null | sed -e 's/.*\///; s/\.yml//')"
+    if [ -z "$cmds" ]; then
+        echo "No manifests found. Make sure they are present in the \$manifest_dir ($manifest_dir)!" >&2
+        exit 1
+    fi
+    echo "$cmds"
+}
+
+up() {
+    if [ -z "$services" ]; then
+        services="$(picker "$(list)" "Pick manifest to run")"
+    fi
+
+    # Use core?
+    if "$use_core"; then
+        if ! (echo "$services" | grep -q "\bcore\b"); then
+            services="core $services"
+        fi
+    fi
+
+    # Check if manifests exist
+    for rs in $services; do
+        s="$(service "$rs")" || true
+        manifest="$manifest_dir/$s.yml"
+        if ! [ -f "$manifest" ]; then
+            echo "Manifest \"$manifest\" does not exist!"
+            exit 1
+        fi
+    done
+
+    # Run services separately
+    tmpdir="/tmp/compose_sh/manifests"
+    mkdir -p "$tmpdir"
+    for rs in $services; do
+        full=false
+        s="$(service "$rs")"
+        if [ "$?" = "123" ]; then
+            full=true
+        fi
+
+        manifest_orig="$manifest_dir/$s.yml"
+        manifest="$tmpdir/$s.yml"
+
+        # Check if already exists
+        if ! (cache check "$manifest"); then
+            echo "Manifest appears to already be running: $manifest"
+            continue
+        fi
+
+        # full
+        cat "$manifest_orig" > "$manifest"
+        # not full
+        if ! $full; then
+            sed -e '/#### FULL START ####/,/#### FULL END ####/d' "$manifest_orig" > "$tmpdir/$s.yml"
+        fi
+
+        # provide the extras directory if it exists (dir with the same name as manifest itself)
+        extras_orig="$manifest_dir/$s"
+        if [ -d "$extras_orig" ]; then
+            extras="$tmpdir/$s"
+            # remove old
+            rm -r "$extras" > /dev/null 2>&1
+            # copy
+            cp -r "$extras_orig" "$extras"
+        fi
+
+        # Run the compose
+        echo "Running manifest: $manifest"
+        docker-compose -f "$manifest" -p "$s" up -d
+        res="$?"
+        if [ "$res" -ne 0 ]; then
+            echo "Command failed"
+            exit "$res"
+        fi
+
+        # Write to cache
+        cache write "$manifest"
+    done
+}
+
+down() {
+    current_manifests="$(cache read)"
+
+    # Checks
+    if [ -z "$current_manifests" ]; then
+        echo "Nothing is running!"
+        exit 1
+    fi
+
+    manifests_to_stop=""
+    if [ -z "$services" ]; then
+        manifests_to_stop="$(picker "$current_manifests" "Pick command to stop")"
+    else
+        for rs in $services; do
+            s="$(service "$rs")" || true
+            manifest="$(echo "$current_manifests" | grep "/$s.yml")"
+            manifests_to_stop="$manifests_to_stop $manifest"
+        done
+    fi
+
+    # stop the compose cmd
+    for m in $manifests_to_stop; do
+        if (cache check "$m"); then
+            echo "Manifest appears to be already stopped: $m"
+            continue
+        fi
+        echo "Stopping manifest: $m"
+        docker-compose -f "$m" -p "$(echo "$m" | sed -e 's/.*\///; s/\.yml//')" down
+        cache delete "$m"
+    done
+
+}
+
+ps() {
+    procs="$(cache read)"
+    if [ -n "$procs" ]; then
+        echo "Running processes:"
+        echo "$procs"
+        return 0
+    fi
+
+    echo "No running processes!"
+}
+
+_pickmanifests() {
+    if [ -z "$services" ]; then
+        services="$(picker "$(list)" "Pick manifest to edit")"
+    fi
+
+    # Edit files in the editor
+    for rs in $services; do
+        s="$(service "$rs")" || true
+        manifest="$manifest_dir/$s.yml"
+        if ! [ -f "$manifest" ]; then
+            echo "Manifest \"$manifest\" does not exist!" >&2
+            continue
+        fi
+
+        echo "$manifest"
+    done
+}
+
+printmanifests() {
+    ms="$(_pickmanifests)"
+    # shellcheck disable=SC2086
+    [ -n "$ms" ] && cat $ms
+}
+
+editmanifests() {
+    [ -z "$EDITOR" ] && EDITOR=vim
+    ms="$(_pickmanifests)"
+    # shellcheck disable=SC2086
+    [ -n "$ms" ] && $EDITOR $ms
+}
+
+newmanifest() {
+
+    template=$(cat <<-END
+version: '3.8'
+
+volumes:
+  postgres: {}
+
+services:
+
+  postgres:
+    image: 'postgres:latest'
+    container_name: pg
+    ports:
+      - 5432:5432
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=postgres
+    volumes:
+      - postgres:/var/lib/postgresql/data
+END
+    )
+
+    template_extra=$(cat <<-END
+
+  #### FULL START ####
+  postgres3:
+    image: 'postgres:latest'
+    container_name: pg-full
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=postgres
+  #### FULL END ####
+END
+    )
+    if [ -z "$services" ]; then
+        printf "Enter new manifest name [string|list]: "
+        read -r services
+    fi
+
+    # Create files and open them in the editor
+    list=""
+    for rs in $services; do
+        full=false
+        # shellcheck disable=SC2086
+        s="$(service "$rs")"
+        if [ "$?" = "123" ]; then
+            full=true
+        fi
+        s="$(echo "$s" | sed -e 's/.*\///; s/\.yml//; s/\.yaml//')"
+
+        manifest="$manifest_dir/$s.yml"
+        list="$list $manifest"
+
+        if ! [ -f "$manifest" ]; then
+            echo "$template" > "$manifest"
+            $full && echo "$template_extra" >> "$manifest"
+        fi
+    done
+
+    [ -z "$EDITOR" ] && EDITOR=vim
+    # shellcheck disable=SC2086
+    [ -n "$list" ] && $EDITOR $list
+}
+
+
+# Sub commands
+case "$command" in
+    "-l"|"--list"|"list")
+        list
+        exit
+        ;;
+    "ps")
+        ps
+        exit
+        ;;
+    "print")
+        printmanifests
+        exit
+        ;;
+    "edit")
+        editmanifests
+        exit
+        ;;
+    "new")
+        newmanifest
+        exit
+        ;;
+    "up")
+        up
+        exit
+        ;;
+    "down")
+        down
+        exit
+        ;;
+    "restart")
+        down
+        up
+        exit
+        ;;
+    "-h"|"--help"|"help")
+        help
+        exit
+        ;;
+    *)
+        echo "Unsupported command: $command"
+        exit 1
+        ;;
+esac
