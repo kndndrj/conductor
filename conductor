@@ -166,13 +166,16 @@ if [ -z "$command" ]; then
     echo "No command provided!"
     exit 1
 fi
-if ! [ -d "$manifest_dir" ]; then
-    echo "Manifest directory \"$manifest_dir\" does not exist!"
-    exit 1
-fi
-if ! (command -v docker-compose > /dev/null); then
-    echo "Please install docker-compose and try again!"
-    exit 1
+
+if [ "$command" != "help" ] && [ "$command" != "--help" ] && [ "$command" != "-h" ]; then
+    if ! [ -d "$manifest_dir" ]; then
+        echo "Manifest directory \"$manifest_dir\" does not exist!"
+        exit 1
+    fi
+    if ! (command -v docker-compose > /dev/null); then
+        echo "Please install docker-compose and try again!"
+        exit 1
+    fi
 fi
 
 # Sub commands
