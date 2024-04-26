@@ -1,15 +1,16 @@
 #!/bin/sh
 
 # Presets
-manifest_dir="$(dirname "$0")/manifests"
+manifest_dir="$HOME/.local/share/conductor/manifests"
+[ -n "$XDG_DATA_HOME" ] && manifest_dir="$XDG_DATA_HOME/conductor/manifests"
+
 cache="/tmp/compose_sh/cache"
 services=""
-use_core=true
 
 # Helpers
 help() {
     echo "Usage:"
-    echo "$0 [--no-core | -m <manifest_dir>] <MANIFESTS> <COMMAND>"
+    echo "$0 [-m <manifest_dir>] <MANIFESTS> <COMMAND>"
     echo
     echo "global args:"
     echo "  -m  --manifest-dir <DIR>        -  custom manifest directory."
@@ -21,7 +22,6 @@ help() {
     echo
     echo "COMMAND:"
     echo "  up      -  run docker-compose up for all specified MANIFESTS"
-    echo "                 args: --no-core  -  don't run the core manifest"
     echo "  down    -  run docker-compose down for all specified MANIFESTS"
     echo "  list    -  list available manifests"
     echo "  ps      -  show running manifests"
@@ -147,9 +147,6 @@ while [ "$#" -gt 1 ]; do
             manifest_dir="$(realpath "$2")"
             shift
             ;;
-        "--no-core")
-            use_core=false
-            ;;
         *)
             if ! (echo "$services" | grep -q "\b$1\b"); then
                 services="$services $1"
@@ -168,19 +165,24 @@ if [ -z "$command" ]; then
 fi
 
 if [ "$command" != "help" ] && [ "$command" != "--help" ] && [ "$command" != "-h" ]; then
-    if ! [ -d "$manifest_dir" ]; then
-        echo "Manifest directory \"$manifest_dir\" does not exist!"
-        exit 1
-    fi
     if ! (command -v docker-compose > /dev/null); then
         echo "Please install docker-compose and try again!"
         exit 1
+    fi
+    if [ -z "$manifest_dir" ]; then
+        echo "Manifest directory not provided!"
+        exit 1
+    fi
+
+    # create the manifest directory if it doesn't exist
+    if ! [ -d "$manifest_dir" ]; then
+        mkdir -p "$manifest_dir"
     fi
 fi
 
 # Sub commands
 list() {
-    cmds="$(find "$manifest_dir" -not -path '*/.*' -type f -name "*.yml" 2>/dev/null | sed -e 's/.*\///; s/\.yml//')"
+    cmds="$(find "$manifest_dir" -type f -name "*.yml" 2>/dev/null | sed -e 's/.*\///; s/\.yml//')"
     if [ -z "$cmds" ]; then
         echo "No manifests found. Make sure they are present in the \$manifest_dir ($manifest_dir)!" >&2
         exit 1
@@ -191,13 +193,6 @@ list() {
 up() {
     if [ -z "$services" ]; then
         services="$(picker "$(list)" "Pick manifest to run")"
-    fi
-
-    # Use core?
-    if "$use_core"; then
-        if ! (echo "$services" | grep -q "\bcore\b"); then
-            services="core $services"
-        fi
     fi
 
     # Check if manifests exist
