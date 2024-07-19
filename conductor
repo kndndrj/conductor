@@ -236,7 +236,7 @@ up() {
         if [ -d "$extras_orig" ]; then
             extras="$tmpdir/$s"
             # remove old
-            rm -r "$extras" > /dev/null 2>&1
+            rm -rf "$extras" > /dev/null 2>&1
             # copy
             cp -r "$extras_orig" "$extras"
         fi
